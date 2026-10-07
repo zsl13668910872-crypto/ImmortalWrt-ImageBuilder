@@ -60,27 +60,74 @@ esac
 
 # 3. 配置网络
 if [ "$count" -eq 1 ]; then
-    # 单网口设备（PVE 旁路由虚拟机场景）：改为静态地址模式
-    # 优先读取工作流 UI 填写的管理地址（编译时写入 custom_router_ip.txt），
-    # 没有则回退到默认 192.168.100.1
+    # ===================================================================
+    # 单网口设备（PVE 旁路由虚拟机场景）：完整旁路由参数一次性写死
+    # 目标：每次编译的固件首次启动即为最终稳定状态，无需再进后台调整
+    # ===================================================================
     IP_VALUE_FILE="/etc/config/custom_router_ip.txt"
     if [ -f "$IP_VALUE_FILE" ]; then
         CUSTOM_IP=$(cat "$IP_VALUE_FILE")
     else
         CUSTOM_IP="192.168.100.1"
     fi
+
+    # ---------- 1. lan：静态 IPv4 + ULA IPv6 ----------
     uci set network.lan.proto='static'
     uci set network.lan.ipaddr="$CUSTOM_IP"
     uci set network.lan.netmask='255.255.255.0'
+    uci set network.lan.broadcast='10.10.10.255'
     # 旁路由上级网关（主路由 RouterOS）
     uci set network.lan.gateway='10.10.10.1'
     # 旁路由自身上网用 DNS（更新订阅/下载组件用）
     uci set network.lan.dns='223.5.5.5 119.29.29.29'
-    # 旁路由不做 DHCP 服务，避免与主路由冲突
+    # lan 口固定 ULA 地址（对应后台 IPv6 地址 fd00::78/64）
+    uci set network.lan.ip6addr='fd00::78/64'
+
+    # ---------- 2. lan6：DHCPv6 客户端（从主路由取 IPv6，不发 RA）----------
+    uci set network.lan6=interface
+    uci set network.lan6.proto='dhcpv6'
+    uci set network.lan6.device='@lan'
+    uci set network.lan6.reqaddress='try'
+    uci set network.lan6.reqprefix='no'
+    uci set network.lan6.norelease='1'
+
+    # ---------- 3. 关闭 lan 的 DHCP / RA / DHCPv6 / NDP ----------
+    # 关键修复：旁路由 odhcpd 默认会发 RA，与主路由 RouterOS 的 RA 打架，
+    # 导致 Apple TV 等设备 IPv6 地址反复出现/消失、WiFi 在有网无网间跳变。
+    # 全网只保留 RouterOS 一个 RA 源。
     uci set dhcp.lan.ignore='1'
+    uci set dhcp.lan.ra='disabled'
+    uci set dhcp.lan.dhcpv6='disabled'
+    uci set dhcp.lan.ndp='disabled'
+    uci set dhcp.lan.ra_slaac='0'
+
+    # ---------- 4. 防火墙：关闭流量卸载（硬件/软件卸载会绕过 OpenClash 的
+    #    nftables 劫持，虚拟机也没有可卸载的硬件，必须为"无"）----------
+    uci set firewall.@defaults[0].flow_offloading='0'
+    uci set firewall.@defaults[0].flow_offloading_hw='0'
+
+    # ---------- 5. 防火墙：tun 区域 + lan→tun 转发 ----------
+    # OpenClash fake-ip 混合/TUN 模式下 mihomo 自动创建 utun，
+    # 该区域作为兜底放行隧道流量（utun 是三层设备，绝不能加入 br-lan 桥）。
+    uci set firewall.tun=zone
+    uci set firewall.tun.name='tun'
+    uci set firewall.tun.input='ACCEPT'
+    uci set firewall.tun.output='ACCEPT'
+    uci set firewall.tun.forward='ACCEPT'
+    uci add_list firewall.tun.device='utun'
+    uci add_list firewall.tun.device='tun+'
+    uci set firewall.lan2tun=forwarding
+    uci set firewall.lan2tun.src='lan'
+    uci set firewall.lan2tun.dest='tun'
+
     uci commit network
     uci commit dhcp
-    echo "single-nic static ip is $CUSTOM_IP" >> $LOGFILE
+    uci commit firewall
+    echo "single-nic bypass-gateway static ip is $CUSTOM_IP" >> $LOGFILE
+
+    # ---------- 6. 彻底停用 odhcpd（RA 已由上面 disabled，双保险）----------
+    /etc/init.d/odhcpd stop 2>/dev/null
+    /etc/init.d/odhcpd disable 2>/dev/null
 elif [ "$count" -gt 1 ]; then
     # 多网口设备配置
     # 配置WAN
