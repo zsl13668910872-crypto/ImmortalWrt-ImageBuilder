@@ -60,13 +60,27 @@ esac
 
 # 3. 配置网络
 if [ "$count" -eq 1 ]; then
-    # 单网口设备，DHCP模式
-    uci set network.lan.proto='dhcp'
-    uci delete network.lan.ipaddr
-    uci delete network.lan.netmask
-    uci delete network.lan.gateway
-    uci delete network.lan.dns
+    # 单网口设备（PVE 旁路由虚拟机场景）：改为静态地址模式
+    # 优先读取工作流 UI 填写的管理地址（编译时写入 custom_router_ip.txt），
+    # 没有则回退到默认 192.168.100.1
+    IP_VALUE_FILE="/etc/config/custom_router_ip.txt"
+    if [ -f "$IP_VALUE_FILE" ]; then
+        CUSTOM_IP=$(cat "$IP_VALUE_FILE")
+    else
+        CUSTOM_IP="192.168.100.1"
+    fi
+    uci set network.lan.proto='static'
+    uci set network.lan.ipaddr="$CUSTOM_IP"
+    uci set network.lan.netmask='255.255.255.0'
+    # 旁路由上级网关（主路由 RouterOS）
+    uci set network.lan.gateway='10.10.10.1'
+    # 旁路由自身上网用 DNS（更新订阅/下载组件用）
+    uci set network.lan.dns='223.5.5.5 119.29.29.29'
+    # 旁路由不做 DHCP 服务，避免与主路由冲突
+    uci set dhcp.lan.ignore='1'
     uci commit network
+    uci commit dhcp
+    echo "single-nic static ip is $CUSTOM_IP" >> $LOGFILE
 elif [ "$count" -gt 1 ]; then
     # 多网口设备配置
     # 配置WAN
